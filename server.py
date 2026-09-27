@@ -218,12 +218,76 @@ async def printful_get_mockup_task(
 
 
 @mcp.tool()
+async def printful_list_ecommerce_sync_products(
+    limit: int = 100,
+    offset: int = 0,
+    status: str | None = None,
+    search: str | None = None,
+    store_id: int | str | None = None,
+) -> dict[str, Any]:
+    """List products imported from a connected ecommerce platform such as Etsy."""
+    params: dict[str, Any] = {"limit": limit, "offset": offset}
+    if status:
+        params["status"] = status
+    if search:
+        params["search"] = search
+    return await _request("GET", "/sync/products", store_id=store_id, params=params)
+
+
+@mcp.tool()
+async def printful_get_ecommerce_sync_product(
+    product_id: int | str,
+    store_id: int | str | None = None,
+) -> dict[str, Any]:
+    """Get a product imported from a connected ecommerce platform."""
+    return await _request("GET", f"/sync/products/{product_id}", store_id=store_id)
+
+
+@mcp.tool()
+async def printful_update_ecommerce_sync_product(
+    product_id: int | str,
+    sync_product: dict[str, Any] | None = None,
+    sync_variants: list[dict[str, Any]] | None = None,
+    store_id: int | str | None = None,
+) -> dict[str, Any]:
+    """Assign Printful catalog variants and print files to an existing ecommerce product."""
+    if sync_product is None and sync_variants is None:
+        raise ValueError("Provide sync_product and/or sync_variants.")
+    payload: dict[str, Any] = {}
+    if sync_product is not None:
+        payload["sync_product"] = sync_product
+    if sync_variants is not None:
+        payload["sync_variants"] = sync_variants
+    return await _request(
+        "PUT",
+        f"/store/products/{product_id}",
+        store_id=store_id,
+        json=payload,
+    )
+
+
+@mcp.tool()
+async def printful_update_ecommerce_sync_variant(
+    sync_variant_id: int | str,
+    variant: dict[str, Any],
+    store_id: int | str | None = None,
+) -> dict[str, Any]:
+    """Update an existing ecommerce sync variant, including its print files."""
+    return await _request(
+        "PUT",
+        f"/sync/variant/{sync_variant_id}",
+        store_id=store_id,
+        json=variant,
+    )
+
+
+@mcp.tool()
 async def printful_create_store_product(
     sync_product: dict[str, Any],
     sync_variants: list[dict[str, Any]],
     store_id: int | str | None = None,
 ) -> dict[str, Any]:
-    """Create a Sync Product in the selected Printful store."""
+    """Create a Sync Product only in a Manual Order/API Printful store; not an Etsy listing."""
     if not sync_product.get("name"):
         raise ValueError("sync_product.name is required.")
     if not sync_variants:
@@ -247,7 +311,7 @@ async def printful_publish_store_product(
     sync_variants: list[dict[str, Any]],
     store_id: int | str | None = None,
 ) -> dict[str, Any]:
-    """Explicit publication call; Printful publication uses POST /store/products."""
+    """Create a product only in a Manual Order/API Printful store; do not use this for Etsy publication."""
     if not sync_product.get("name"):
         raise ValueError("sync_product.name is required.")
     if not sync_variants:
