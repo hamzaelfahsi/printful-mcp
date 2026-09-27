@@ -15,7 +15,7 @@ from starlette.routing import Mount, Route
 from cryptography.fernet import Fernet
 from redis.asyncio import Redis
 
-mcp = FastMCP("Printful Manager")
+mcp = FastMCP("Printify Manager")
 BASE_URL = "https://api.printful.com"
 
 def _headers(store_id: int | str | None = None) -> dict[str, str]:
@@ -464,484 +464,192 @@ async def printful_get_order(order_id: int | str, store_id: int | str | None = N
 
 
 
-async def _etsy_token_store() -> Redis:
-    url = os.environ.get("REDIS_URL", "").strip()
-    if not url:
-        raise RuntimeError("REDIS_URL is not configured on the server.")
+BASE_URL = "https://api.printify.com/v1"
+MCP_BASE_URL = os.environ.get("MCP_BASE_URL", "https://printful-mcp-hyfr.onrender.com").rstrip("/")
+
+def _printify_headers() -> dict[str, str]:
+    token = os.environ.get("PRINTIFY_API_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("PRINTIFY_API_TOKEN is not configured on the server.")
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json;charset=utf-8", "Accept": "application/json"}
+
+async def _request(method: str, path: str, *, params: dict[str, Any] | None = None, json_body: dict[str, Any] | None = None) -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.request(method, BASE_URL + path, headers=_printify_headers(), params=params, json=json_body)
+    if r.is_error:
+        try: detail = r.json()
+        except ValueError: detail = r.text[:2000]
+        raise RuntimeError(f"Printify API {r.status_code}: {detail}")
+    if r.status_code == 204: return {"ok": True}
+    return r.json()
+
+@mcp.tool()
+async def printify_test_connection() -> dict[str, Any]:
+    return {"ok": True, "service": "Printify", "shops": await _request("GET", "/shops.json")}
+
+@mcp.tool()
+async def printify_list_shops() -> dict[str, Any]:
+    return await _request("GET", "/shops.json")
+
+@mcp.tool()
+async def printify_get_shop(shop_id: int | str) -> dict[str, Any]:
+    return await _request("GET", f"/shops/{shop_id}.json")
+
+@mcp.tool()
+async def printify_list_products(shop_id: int | str, page: int = 1, limit: int = 50) -> dict[str, Any]:
+    return await _request("GET", f"/shops/{shop_id}/products.json", params={"page": page, "limit": min(limit,50)})
+
+@mcp.tool()
+async def printify_get_product(shop_id: int | str, product_id: str) -> dict[str, Any]:
+    return await _request("GET", f"/shops/{shop_id}/products/{product_id}.json")
+
+@mcp.tool()
+async def printify_list_blueprints(page: int = 1, limit: int = 50) -> dict[str, Any]:
+    return await _request("GET", "/catalog/blueprints.json", params={"page":page,"limit":min(limit,50)})
+
+@mcp.tool()
+async def printify_get_blueprint(blueprint_id: int | str) -> dict[str, Any]:
+    return await _request("GET", f"/catalog/blueprints/{blueprint_id}.json")
+
+@mcp.tool()
+async def printify_list_print_providers(blueprint_id: int | str) -> dict[str, Any]:
+    return await _request("GET", f"/catalog/blueprints/{blueprint_id}/print_providers.json")
+
+@mcp.tool()
+async def printify_list_variants(blueprint_id: int | str, print_provider_id: int | str) -> dict[str, Any]:
+    return await _request("GET", f"/catalog/blueprints/{blueprint_id}/print_providers/{print_provider_id}/variants.json")
+
+@mcp.tool()
+async def printify_list_uploads(page: int = 1, limit: int = 50) -> dict[str, Any]:
+    return await _request("GET", "/uploads.json", params={"page":page,"limit":min(limit,50)})
+
+@mcp.tool()
+async def printify_upload_image_url(url: str, file_name: str = "design.png") -> dict[str, Any]:
+    return await _request("POST", "/uploads/images.json", json_body={"file_name":file_name,"url":url})
+
+@mcp.tool()
+async def printify_upload_image_base64(file_name: str, contents: str) -> dict[str, Any]:
+    return await _request("POST", "/uploads/images.json", json_body={"file_name":file_name,"contents":contents})
+
+@mcp.tool()
+async def printify_create_product(shop_id: int | str, title: str, description: str, blueprint_id: int, print_provider_id: int, variants: list[dict[str,Any]], print_areas: list[dict[str,Any]], tags: list[str] | None = None, visible: bool = True) -> dict[str,Any]:
+    if not variants or not print_areas: raise ValueError("variants and print_areas are required.")
+    body={"title":title,"description":description,"blueprint_id":blueprint_id,"print_provider_id":print_provider_id,"variants":variants,"print_areas":print_areas,"visible":visible}
+    if tags is not None: body["tags"]=tags
+    return await _request("POST", f"/shops/{shop_id}/products.json", json_body=body)
+
+@mcp.tool()
+async def printify_create_test_product(shop_id: int | str, blueprint_id: int, print_provider_id: int, image_id: str, title: str = "TEST - Printify MCP", price: int = 1999) -> dict[str,Any]:
+    data=await printify_list_variants(blueprint_id,print_provider_id)
+    variants=data.get("data",data.get("variants",[]))
+    available=[v for v in variants if v.get("is_available",True)]
+    if not available: raise RuntimeError("No available variant returned.")
+    selected=available[:1]; ids=[int(v["id"]) for v in selected]
+    return await printify_create_product(shop_id,title,"Temporary product created to verify Printify Manager.",blueprint_id,print_provider_id,[{"id":i,"price":price,"is_enabled":True} for i in ids],[{"variant_ids":ids,"placeholders":[{"position":"front","images":[{"id":image_id,"x":0.5,"y":0.5,"scale":1,"angle":0}]}]}],["test","printify","mcp"],True)
+
+@mcp.tool()
+async def printify_update_product(shop_id: int | str, product_id: str, product: dict[str,Any]) -> dict[str,Any]:
+    return await _request("PUT", f"/shops/{shop_id}/products/{product_id}.json", json_body=product)
+
+@mcp.tool()
+async def printify_delete_product(shop_id: int | str, product_id: str) -> dict[str,Any]:
+    return await _request("DELETE", f"/shops/{shop_id}/products/{product_id}.json")
+
+@mcp.tool()
+async def printify_publish_product(shop_id: int | str, product_id: str, title: bool=True, description: bool=True, images: bool=True, variants: bool=True, tags: bool=True, key_features: bool=True, shipping_template: bool=True) -> dict[str,Any]:
+    return await _request("POST", f"/shops/{shop_id}/products/{product_id}/publish.json", json_body={"title":title,"description":description,"images":images,"variants":variants,"tags":tags,"keyFeatures":key_features,"shipping_template":shipping_template})
+
+@mcp.tool()
+async def printify_list_orders(shop_id: int | str, page: int=1, limit: int=50) -> dict[str,Any]:
+    return await _request("GET", f"/shops/{shop_id}/orders.json", params={"page":page,"limit":min(limit,50)})
+
+@mcp.tool()
+async def printify_get_order(shop_id: int | str, order_id: str) -> dict[str,Any]:
+    return await _request("GET", f"/shops/{shop_id}/orders/{order_id}.json")
+
+@mcp.tool()
+async def printify_create_order(shop_id: int | str, order: dict[str,Any]) -> dict[str,Any]:
+    return await _request("POST", f"/shops/{shop_id}/orders.json", json_body=order)
+
+# MCP OAuth 2.1 bridge
+async def _oauth_redis() -> Redis:
+    url=os.environ.get("REDIS_URL","").strip()
+    if not url: raise RuntimeError("REDIS_URL is not configured on the server.")
     return Redis.from_url(url, decode_responses=True)
 
+async def _oauth_put(key:str,value:str,ttl:int=600):
+    db=await _oauth_redis()
+    try: await db.setex(key,ttl,value)
+    finally: await db.aclose()
 
-def _etsy_fernet() -> Fernet:
-    key = os.environ.get("ETSY_TOKEN_ENCRYPTION_KEY", "").strip()
-    if not key:
-        raise RuntimeError("ETSY_TOKEN_ENCRYPTION_KEY is not configured on the server.")
-    return Fernet(key.encode("ascii"))
+async def _oauth_get(key:str):
+    db=await _oauth_redis()
+    try: return await db.get(key)
+    finally: await db.aclose()
 
+async def _oauth_delete(key:str):
+    db=await _oauth_redis()
+    try: await db.delete(key)
+    finally: await db.aclose()
 
-async def _etsy_save_tokens(token_data: dict[str, Any]) -> None:
-    refresh_token = token_data.get("refresh_token")
-    if not refresh_token:
-        raise RuntimeError("Etsy did not return a refresh token.")
-    payload = {
-        "refresh_token": refresh_token,
-        "scope": token_data.get("scope", ""),
-    }
-    db = await _etsy_token_store()
-    try:
-        await db.set("etsy:oauth", _etsy_fernet().encrypt(json.dumps(payload).encode()).decode())
-    finally:
-        await db.aclose()
-
-
-async def _etsy_load_tokens() -> dict[str, Any] | None:
-    db = await _etsy_token_store()
-    try:
-        raw = await db.get("etsy:oauth")
-    finally:
-        await db.aclose()
-    if not raw:
-        return None
-    try:
-        return json.loads(_etsy_fernet().decrypt(raw.encode()).decode())
-    except Exception as exc:
-        raise RuntimeError("Stored Etsy credentials could not be decrypted.") from exc
-
-
-async def _etsy_access_token() -> str:
-    stored = await _etsy_load_tokens()
-    if not stored or not stored.get("refresh_token"):
-        raise RuntimeError("Etsy is not authorized yet. Open /etsy/oauth/start first.")
-    client_id = _etsy_client_id()
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            "https://api.etsy.com/v3/public/oauth/token",
-            data={
-                "grant_type": "refresh_token",
-                "client_id": client_id,
-                "refresh_token": stored["refresh_token"],
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-    if response.is_error:
-        try:
-            detail = response.json()
-        except ValueError:
-            detail = response.text[:1000]
-        raise RuntimeError(f"Etsy refresh failed: {detail}")
-    token_data = response.json()
-    await _etsy_save_tokens(token_data)
-    return token_data["access_token"]
-
-
-@mcp.tool()
-async def etsy_test_connection() -> dict[str, Any]:
-    try:
-        access_token = await _etsy_access_token()
-        return {"ok": True, "authorized": True, "token_refreshed": bool(access_token)}
-    except RuntimeError as exc:
-        return {"ok": False, "authorized": False, "error": str(exc)}
-
-
-def _etsy_client_id() -> str:
-    value = os.environ.get("ETSY_CLIENT_ID", "").strip()
-    if not value:
-        raise RuntimeError("ETSY_CLIENT_ID is not configured on the server.")
-    return value
-
-def _etsy_api_key() -> str:
-    key = os.environ.get("ETSY_API_KEY", "").strip()
-    if key:
-        return key
-    client_id = os.environ.get("ETSY_CLIENT_ID", "").strip()
-    secret = os.environ.get("ETSY_CLIENT_SECRET", "").strip()
-    if client_id and secret:
-        return f"{client_id}:{secret}"
-    raise RuntimeError("ETSY_API_KEY or ETSY_CLIENT_SECRET is not configured on the server.")
-
-async def _etsy_request(
-    method: str,
-    path: str,
-    *,
-    data: dict[str, Any] | None = None,
-    params: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    access_token = await _etsy_access_token()
-    headers = {
-        "x-api-key": _etsy_api_key(),
-        "Authorization": f"Bearer {access_token}",
-    }
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.request(
-            method,
-            "https://api.etsy.com/v3/application" + path,
-            headers=headers,
-            data=data,
-            params=params,
-        )
-    if response.is_error:
-        try:
-            detail = response.json()
-        except ValueError:
-            detail = response.text[:2000]
-        raise RuntimeError(f"Etsy API {response.status_code}: {detail}")
-    if response.status_code == 204:
-        return {"ok": True}
-    return response.json()
-
-@mcp.tool()
-async def etsy_get_me() -> dict[str, Any]:
-    """Return the authenticated Etsy user."""
-    return await _etsy_request("GET", "/users/me")
-
-@mcp.tool()
-async def etsy_list_my_shops() -> dict[str, Any]:
-    """List the Etsy shops owned by the authenticated user."""
-    me = await _etsy_request("GET", "/users/me")
-    user_id = me.get("user_id")
-    if not user_id:
-        raise RuntimeError("Etsy did not return the authenticated user_id.")
-    return await _etsy_request("GET", f"/users/{user_id}/shops")
-
-@mcp.tool()
-async def etsy_create_draft_listing(
-    title: str,
-    description: str,
-    price: float,
-    quantity: int = 1,
-    taxonomy_id: int = 0,
-    shop_id: int | None = None,
-    who_made: str = "i_did",
-    when_made: str = "made_to_order",
-    tags: list[str] | None = None,
-    materials: list[str] | None = None,
-) -> dict[str, Any]:
-    """Create an Etsy draft listing. It does not publish the listing."""
-    if not title.strip():
-        raise ValueError("title is required.")
-    if price <= 0:
-        raise ValueError("price must be greater than zero.")
-    if quantity < 1:
-        raise ValueError("quantity must be at least 1.")
-    if taxonomy_id < 1:
-        raise ValueError("taxonomy_id must be provided; use etsy_get_seller_taxonomy to find it.")
-    if shop_id is None:
-        shops = await etsy_list_my_shops()
-        shop_id = shops.get("shop_id")
-        if not shop_id:
-            raise RuntimeError("No Etsy shop was found for the authenticated account.")
-    data: dict[str, Any] = {
-        "quantity": str(quantity),
-        "title": title,
-        "description": description,
-        "price": str(price),
-        "who_made": who_made,
-        "when_made": when_made,
-        "taxonomy_id": str(taxonomy_id),
-        "type": "physical",
-    }
-    if tags:
-        data["tags"] = ",".join(tags[:13])
-    if materials:
-        data["materials"] = ",".join(materials)
-    return await _etsy_request("POST", f"/shops/{shop_id}/listings", data=data)
-
-@mcp.tool()
-async def etsy_get_seller_taxonomy() -> dict[str, Any]:
-    """Get Etsy seller taxonomy nodes used to select a valid listing category."""
-    return await _etsy_request("GET", "/seller-taxonomy/nodes")
-
-
-def _etsy_redirect_uri(request) -> str:
-    configured = os.environ.get("ETSY_REDIRECT_URI", "").strip()
-    if configured:
-        return configured
-    return str(request.base_url).rstrip("/") + "/etsy/oauth/callback"
-
-def _pkce_challenge(verifier: str) -> str:
-    digest = hashlib.sha256(verifier.encode("ascii")).digest()
-    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
-
-async def etsy_oauth_start(request):
-    try:
-        client_id = _etsy_client_id()
-    except RuntimeError as exc:
-        return JSONResponse({"ok": False, "error": str(exc), "setup": "Set ETSY_CLIENT_ID in Render, then redeploy.", "redirect_uri": _etsy_redirect_uri(request)}, status_code=503)
-    state = secrets.token_urlsafe(32)
-    verifier = secrets.token_urlsafe(64)
-    challenge = _pkce_challenge(verifier)
-    redirect_uri = _etsy_redirect_uri(request)
-    scopes = os.environ.get("ETSY_SCOPES", "listings_r listings_w shops_r").strip()
-    query = urlencode({"response_type": "code", "client_id": client_id, "redirect_uri": redirect_uri, "scope": scopes, "state": state, "code_challenge": challenge, "code_challenge_method": "S256"})
-    response = RedirectResponse(url=f"https://www.etsy.com/oauth/connect?{query}", status_code=302)
-    response.set_cookie("etsy_oauth_state", state, max_age=600, httponly=True, secure=True, samesite="lax", path="/etsy/oauth")
-    response.set_cookie("etsy_oauth_verifier", verifier, max_age=600, httponly=True, secure=True, samesite="lax", path="/etsy/oauth")
-    return response
-
-async def etsy_oauth_callback(request):
-    params = request.query_params
-    if params.get("error"):
-        return JSONResponse({"ok": False, "error": params.get("error"), "error_description": params.get("error_description")}, status_code=400)
-    code = params.get("code")
-    state = params.get("state")
-    saved_state = request.cookies.get("etsy_oauth_state")
-    verifier = request.cookies.get("etsy_oauth_verifier")
-    if not code or not state:
-        return JSONResponse({"ok": False, "error": "Missing Etsy authorization code or state."}, status_code=400)
-    if not saved_state or not secrets.compare_digest(state, saved_state):
-        return JSONResponse({"ok": False, "error": "Invalid OAuth state. Restart authorization from the start URL."}, status_code=400)
-    if not verifier:
-        return JSONResponse({"ok": False, "error": "Missing PKCE verifier cookie. Restart authorization from the start URL."}, status_code=400)
-    try:
-        client_id = _etsy_client_id()
-    except RuntimeError as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
-    redirect_uri = _etsy_redirect_uri(request)
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        token_response = await client.post("https://api.etsy.com/v3/public/oauth/token", data={"grant_type": "authorization_code", "client_id": client_id, "redirect_uri": redirect_uri, "code": code, "code_verifier": verifier}, headers={"Content-Type": "application/x-www-form-urlencoded"})
-    if token_response.is_error:
-        try:
-            detail = token_response.json()
-        except ValueError:
-            detail = token_response.text[:1000]
-        return JSONResponse({"ok": False, "error": "Etsy token exchange failed.", "detail": detail}, status_code=502)
-    await _etsy_save_tokens(token_response.json())
-    response = JSONResponse({"ok": True, "message": "Etsy authorization completed.", "next_step": "Etsy OAuth is now stored securely. You can use the Etsy listing tools.", "token_received": True})
-    response.delete_cookie("etsy_oauth_state", path="/etsy/oauth")
-    response.delete_cookie("etsy_oauth_verifier", path="/etsy/oauth")
-    return response
-
-async def etsy_oauth_info(request):
-    return JSONResponse({"ok": True, "authorization_start": str(request.base_url).rstrip("/") + "/etsy/oauth/start", "redirect_uri": _etsy_redirect_uri(request), "scopes": os.environ.get("ETSY_SCOPES", "listings_r listings_w shops_r"), "client_id_configured": bool(os.environ.get("ETSY_CLIENT_ID", "").strip())})
-
-
-async def etsy_status(request):
-    try:
-        stored = await _etsy_load_tokens()
-        return JSONResponse({"ok": True, "authorized": bool(stored), "scope": stored.get("scope", "") if stored else None})
-    except RuntimeError as exc:
-        return JSONResponse({"ok": False, "authorized": False, "error": str(exc)}, status_code=503)
-
-
-# ---------------------------------------------------------------------------
-# MCP OAuth 2.1 bridge
-# ---------------------------------------------------------------------------
-
-MCP_BASE_URL = "https://printful-mcp-hyfr.onrender.com"
-MCP_ETSY_CALLBACK = f"{MCP_BASE_URL}/etsy/oauth/callback"
-
-async def _mcp_oauth_put(key: str, value: str, ttl: int = 600) -> None:
-    db = await _etsy_token_store()
-    try:
-        await db.setex(key, ttl, value)
-    finally:
-        await db.aclose()
-
-async def _mcp_oauth_get(key: str) -> str | None:
-    db = await _etsy_token_store()
-    try:
-        return await db.get(key)
-    finally:
-        await db.aclose()
-
-async def _mcp_oauth_delete(key: str) -> None:
-    db = await _etsy_token_store()
-    try:
-        await db.delete(key)
-    finally:
-        await db.aclose()
-
-async def _mcp_oauth_json_or_form(request) -> dict[str, Any]:
-    body = await request.body()
-    content_type = request.headers.get("content-type", "").lower()
-    if "application/json" in content_type:
-        try:
-            value = json.loads(body.decode("utf-8") or "{}")
-            return value if isinstance(value, dict) else {}
-        except json.JSONDecodeError:
-            return {}
-    parsed = parse_qs(body.decode("utf-8"), keep_blank_values=True)
-    return {key: values[-1] if values else "" for key, values in parsed.items()}
+async def _oauth_body(request):
+    body=await request.body()
+    if "application/json" in request.headers.get("content-type","").lower():
+        try: return json.loads(body.decode() or "{}")
+        except Exception: return {}
+    return {k:v[-1] for k,v in parse_qs(body.decode(),keep_blank_values=True).items()}
 
 async def mcp_oauth_register(request):
-    payload = await _mcp_oauth_json_or_form(request)
-    redirect_uris = payload.get("redirect_uris", [])
-    if isinstance(redirect_uris, str):
-        redirect_uris = [redirect_uris]
-    if not isinstance(redirect_uris, list) or not redirect_uris:
-        return JSONResponse({"error": "invalid_client_metadata", "error_description": "redirect_uris is required."}, status_code=400)
-    client_id = "mcp_" + secrets.token_urlsafe(24)
-    client_name = payload.get("client_name") or "MCP client"
-    await _mcp_oauth_put(f"mcp:client:{client_id}", json.dumps({"client_name": client_name, "redirect_uris": redirect_uris}), ttl=31536000)
-    return JSONResponse({
-        "client_id": client_id,
-        "client_name": client_name,
-        "redirect_uris": redirect_uris,
-        "token_endpoint_auth_method": "none",
-        "grant_types": ["authorization_code", "refresh_token"],
-        "response_types": ["code"],
-    })
+    p=await _oauth_body(request); uris=p.get("redirect_uris",[])
+    if isinstance(uris,str): uris=[uris]
+    if not uris: return JSONResponse({"error":"invalid_client_metadata"},status_code=400)
+    cid="mcp_"+secrets.token_urlsafe(24)
+    await _oauth_put(f"mcp:client:{cid}",json.dumps({"redirect_uris":uris}),31536000)
+    return JSONResponse({"client_id":cid,"redirect_uris":uris,"token_endpoint_auth_method":"none","grant_types":["authorization_code","refresh_token"],"response_types":["code"]})
 
 async def mcp_oauth_authorize(request):
-    q = request.query_params
-    resource = q.get("resource", "")
-    if resource and resource != MCP_BASE_URL:
-        return JSONResponse({"error": "invalid_target", "error_description": "Invalid resource."}, status_code=400)
-    client_id = q.get("client_id", "")
-    redirect_uri = q.get("redirect_uri", "")
-    response_type = q.get("response_type", "")
-    scope = q.get("scope", os.environ.get("ETSY_SCOPES", "listings_r listings_w shops_r"))
-    state = q.get("state", "")
-    code_challenge = q.get("code_challenge", "")
-    code_challenge_method = q.get("code_challenge_method", "")
-    client_raw = await _mcp_oauth_get(f"mcp:client:{client_id}")
-    if not client_raw:
-        return JSONResponse({"error": "invalid_client"}, status_code=400)
-    client = json.loads(client_raw)
-    if response_type != "code" or redirect_uri not in client.get("redirect_uris", []):
-        return JSONResponse({"error": "invalid_request", "error_description": "Invalid response_type or redirect_uri."}, status_code=400)
-    if not code_challenge or code_challenge_method != "S256":
-        return JSONResponse({"error": "invalid_request", "error_description": "PKCE S256 is required."}, status_code=400)
-    transaction = secrets.token_urlsafe(32)
-    verifier = secrets.token_urlsafe(64)
-    upstream_challenge = _pkce_challenge(verifier)
-    await _mcp_oauth_put(f"mcp:txn:{transaction}", json.dumps({
-        "client_id": client_id,
-        "redirect_uri": redirect_uri,
-        "state": state,
-        "resource": resource or MCP_BASE_URL,
-        "code_challenge": code_challenge,
-        "code_challenge_method": code_challenge_method,
-        "upstream_verifier": verifier,
-    }), ttl=600)
-    query = urlencode({
-        "response_type": "code",
-        "client_id": _etsy_client_id(),
-        "redirect_uri": MCP_ETSY_CALLBACK,
-        "scope": scope,
-        "state": "mcp_" + transaction,
-        "code_challenge": upstream_challenge,
-        "code_challenge_method": "S256",
-    })
-    return RedirectResponse(f"https://www.etsy.com/oauth/connect?{query}", status_code=302)
+    q=request.query_params; raw=await _oauth_get(f"mcp:client:{q.get('client_id','')}")
+    if not raw: return JSONResponse({"error":"invalid_client"},status_code=400)
+    c=json.loads(raw); redirect=q.get("redirect_uri","")
+    if q.get("response_type")!="code" or redirect not in c.get("redirect_uris",[]): return JSONResponse({"error":"invalid_request"},status_code=400)
+    if q.get("code_challenge_method")!="S256" or not q.get("code_challenge"): return JSONResponse({"error":"invalid_request","error_description":"PKCE S256 is required."},status_code=400)
+    code=secrets.token_urlsafe(48)
+    await _oauth_put(f"mcp:code:{code}",json.dumps({"client_id":q.get("client_id"),"redirect_uri":redirect,"code_challenge":q.get("code_challenge"),"resource":q.get("resource",MCP_BASE_URL)}),600)
+    return RedirectResponse(redirect+"?"+urlencode({"code":code,"state":q.get("state","")}),status_code=302)
 
 async def mcp_oauth_token(request):
-    payload = await _mcp_oauth_json_or_form(request)
-    resource = payload.get("resource", "")
-    if resource and resource != MCP_BASE_URL:
-        return JSONResponse({"error": "invalid_target", "error_description": "Invalid resource."}, status_code=400)
-    grant_type = payload.get("grant_type", "")
-    if grant_type == "authorization_code":
-        code = payload.get("code", "")
-        verifier = payload.get("code_verifier", "")
-        txn_raw = await _mcp_oauth_get(f"mcp:code:{code}")
-        if not txn_raw or not verifier:
-            return JSONResponse({"error": "invalid_grant"}, status_code=400)
-        txn = json.loads(txn_raw)
-        if _pkce_challenge(verifier) != txn.get("code_challenge"):
-            return JSONResponse({"error": "invalid_grant"}, status_code=400)
-        await _mcp_oauth_delete(f"mcp:code:{code}")
-        access_token = secrets.token_urlsafe(48)
-        refresh_token = secrets.token_urlsafe(48)
-        await _mcp_oauth_put(f"mcp:token:{access_token}", json.dumps({"client_id": txn["client_id"], "resource": txn.get("resource", MCP_BASE_URL)}), ttl=3600)
-        await _mcp_oauth_put(f"mcp:refresh:{refresh_token}", json.dumps({"client_id": txn["client_id"], "resource": txn.get("resource", MCP_BASE_URL)}), ttl=2592000)
-        return JSONResponse({"access_token": access_token, "token_type": "Bearer", "expires_in": 3600, "refresh_token": refresh_token, "scope": os.environ.get("ETSY_SCOPES", "listings_r listings_w shops_r")})
-    if grant_type == "refresh_token":
-        old_refresh = payload.get("refresh_token", "")
-        raw = await _mcp_oauth_get(f"mcp:refresh:{old_refresh}")
-        if not raw:
-            return JSONResponse({"error": "invalid_grant"}, status_code=400)
-        access_token = secrets.token_urlsafe(48)
-        await _mcp_oauth_put(f"mcp:token:{access_token}", raw, ttl=3600)
-        return JSONResponse({"access_token": access_token, "token_type": "Bearer", "expires_in": 3600, "scope": os.environ.get("ETSY_SCOPES", "listings_r listings_w shops_r")})
-    return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
-
-async def mcp_oauth_etsy_callback(request):
-    params = request.query_params
-    state = params.get("state", "")
-    if not state.startswith("mcp_"):
-        return await etsy_oauth_callback(request)
-    transaction = state[4:]
-    txn_raw = await _mcp_oauth_get(f"mcp:txn:{transaction}")
-    if not txn_raw:
-        return JSONResponse({"error": "invalid_request", "error_description": "OAuth transaction expired."}, status_code=400)
-    txn = json.loads(txn_raw)
-    if params.get("error"):
-        query = urlencode({"error": params.get("error"), "error_description": params.get("error_description", ""), "state": txn.get("state", "")})
-        await _mcp_oauth_delete(f"mcp:txn:{transaction}")
-        return RedirectResponse(f"{txn['redirect_uri']}?{query}", status_code=302)
-    code = params.get("code")
-    if not code:
-        return JSONResponse({"error": "invalid_request", "error_description": "Missing Etsy authorization code."}, status_code=400)
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        token_response = await client.post(
-            "https://api.etsy.com/v3/public/oauth/token",
-            data={"grant_type": "authorization_code", "client_id": _etsy_client_id(), "redirect_uri": MCP_ETSY_CALLBACK, "code": code, "code_verifier": txn["upstream_verifier"]},
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-    if token_response.is_error:
-        query = urlencode({"error": "server_error", "error_description": "Etsy token exchange failed.", "state": txn.get("state", "")})
-        return RedirectResponse(f"{txn['redirect_uri']}?{query}", status_code=302)
-    await _etsy_save_tokens(token_response.json())
-    auth_code = secrets.token_urlsafe(48)
-    await _mcp_oauth_put(f"mcp:code:{auth_code}", json.dumps({
-        "client_id": txn["client_id"], "redirect_uri": txn["redirect_uri"], "state": txn.get("state", ""), "code_challenge": txn["code_challenge"]
-    }), ttl=600)
-    await _mcp_oauth_delete(f"mcp:txn:{transaction}")
-    query = urlencode({"code": auth_code, "state": txn.get("state", "")})
-    return RedirectResponse(f"{txn['redirect_uri']}?{query}", status_code=302)
+    p=await _oauth_body(request)
+    if p.get("grant_type")=="authorization_code":
+        raw=await _oauth_get(f"mcp:code:{p.get('code','')}")
+        if not raw or not p.get("code_verifier"): return JSONResponse({"error":"invalid_grant"},status_code=400)
+        d=json.loads(raw); digest=hashlib.sha256(p["code_verifier"].encode()).digest(); challenge=base64.urlsafe_b64encode(digest).decode().rstrip("=")
+        if challenge!=d.get("code_challenge"): return JSONResponse({"error":"invalid_grant"},status_code=400)
+        await _oauth_delete(f"mcp:code:{p['code']}")
+        access=secrets.token_urlsafe(48); refresh=secrets.token_urlsafe(48); td=json.dumps({"client_id":d["client_id"],"resource":d["resource"]})
+        await _oauth_put(f"mcp:token:{access}",td,3600); await _oauth_put(f"mcp:refresh:{refresh}",td,2592000)
+        return JSONResponse({"access_token":access,"token_type":"Bearer","expires_in":3600,"refresh_token":refresh})
+    if p.get("grant_type")=="refresh_token":
+        raw=await _oauth_get(f"mcp:refresh:{p.get('refresh_token','')}")
+        if not raw: return JSONResponse({"error":"invalid_grant"},status_code=400)
+        access=secrets.token_urlsafe(48); await _oauth_put(f"mcp:token:{access}",raw,3600)
+        return JSONResponse({"access_token":access,"token_type":"Bearer","expires_in":3600})
+    return JSONResponse({"error":"unsupported_grant_type"},status_code=400)
 
 async def mcp_oauth_protected_resource(request):
-    return JSONResponse({
-        "resource": MCP_BASE_URL,
-        "authorization_servers": [MCP_BASE_URL],
-        "scopes_supported": os.environ.get("ETSY_SCOPES", "listings_r listings_w shops_r").split(),
-        "bearer_methods_supported": ["header"],
-    })
+    return JSONResponse({"resource":MCP_BASE_URL,"authorization_servers":[MCP_BASE_URL],"scopes_supported":["printify"],"bearer_methods_supported":["header"]})
 
 async def mcp_oauth_authorization_server(request):
-    return JSONResponse({
-        "issuer": MCP_BASE_URL,
-        "authorization_endpoint": f"{MCP_BASE_URL}/oauth/authorize",
-        "token_endpoint": f"{MCP_BASE_URL}/oauth/token",
-        "registration_endpoint": f"{MCP_BASE_URL}/oauth/register",
-        "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code", "refresh_token"],
-        "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["none"],
-        "scopes_supported": os.environ.get("ETSY_SCOPES", "listings_r listings_w shops_r").split(),
-    })
+    return JSONResponse({"issuer":MCP_BASE_URL,"authorization_endpoint":MCP_BASE_URL+"/oauth/authorize","token_endpoint":MCP_BASE_URL+"/oauth/token","registration_endpoint":MCP_BASE_URL+"/oauth/register","response_types_supported":["code"],"grant_types_supported":["authorization_code","refresh_token"],"code_challenge_methods_supported":["S256"],"token_endpoint_auth_methods_supported":["none"],"scopes_supported":["printify"]})
 
-async def mcp_oauth_guard(request, call_next):
-    if request.url.path != "/mcp":
-        return await call_next(request)
-    authorization = request.headers.get("authorization", "")
-    metadata_url = f"{MCP_BASE_URL}/.well-known/oauth-protected-resource"
-    if not authorization.startswith("Bearer "):
-        return JSONResponse(
-            {"error": "unauthorized"},
-            status_code=401,
-            headers={"WWW-Authenticate": f'Bearer resource_metadata="{metadata_url}", error="invalid_token", error_description="Authentication required."'},
-        )
-    token = authorization[7:].strip()
-    raw = await _mcp_oauth_get(f"mcp:token:{token}") if token else None
-    if not raw:
-        return JSONResponse(
-            {"error": "invalid_token"},
-            status_code=401,
-            headers={"WWW-Authenticate": f'Bearer resource_metadata="{metadata_url}", error="invalid_token", error_description="Access token is invalid or expired."'},
-        )
-    try:
-        token_data = json.loads(raw)
-    except Exception:
-        token_data = {}
-    if token_data.get("resource", MCP_BASE_URL) != MCP_BASE_URL:
-        return JSONResponse(
-            {"error": "invalid_token"},
-            status_code=401,
-            headers={"WWW-Authenticate": f'Bearer resource_metadata="{metadata_url}", error="invalid_token", error_description="Token audience is invalid."'},
-        )
+async def mcp_oauth_guard(request,call_next):
+    if request.url.path!="/mcp": return await call_next(request)
+    auth=request.headers.get("authorization",""); metadata=MCP_BASE_URL+"/.well-known/oauth-protected-resource"
+    if not auth.startswith("Bearer "): return JSONResponse({"error":"unauthorized"},status_code=401,headers={"WWW-Authenticate":f'Bearer resource_metadata="{metadata}"'})
+    if not await _oauth_get("mcp:token:"+auth[7:].strip()): return JSONResponse({"error":"invalid_token"},status_code=401)
     return await call_next(request)
 
+async def health(request):
+    return JSONResponse({"ok":True,"service":"Printify Manager","mcp":"/mcp","printify_api_configured":bool(os.environ.get("PRINTIFY_API_TOKEN","").strip())})
 
 async def health(request):
     return JSONResponse({"ok": True, "service": "Printful Manager", "mcp": "/mcp"})
