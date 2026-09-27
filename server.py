@@ -419,8 +419,42 @@ async def health(request):
     })
 
 
+async def diagnostics_printify(request):
+    """Real, read-only backend connectivity test against Printify."""
+    result = {
+        "ok": False,
+        "service": "Printify Manager",
+        "printify_api_configured": bool(os.environ.get("PRINTIFY_API_TOKEN", "").strip()),
+    }
+    if not result["printify_api_configured"]:
+        result["error"] = "PRINTIFY_API_TOKEN is not configured on the server."
+        return JSONResponse(result, status_code=503)
+    try:
+        data = await _printify_request("GET", "/shops.json")
+        shops = data.get("data", data if isinstance(data, list) else [])
+        result.update({
+            "ok": True,
+            "printify_api_ok": True,
+            "shop_count": len(shops) if isinstance(shops, list) else None,
+            "shops": [
+                {
+                    "id": shop.get("id"),
+                    "title": shop.get("title"),
+                    "type": shop.get("type"),
+                }
+                for shop in shops
+                if isinstance(shop, dict)
+            ],
+        })
+        return JSONResponse(result)
+    except Exception as exc:
+        result["printify_api_ok"] = False
+        result["error"] = str(exc)
+        return JSONResponse(result, status_code=502)
+
+
 async def oauth_guard(request, call_next):
-    if request.url.path != "/mcp":
+    if request.url.path.rstrip("/") != "/mcp":
         return await call_next(request)
     authorization = request.headers.get("authorization", "")
     metadata = MCP_BASE_URL + "/.well-known/oauth-protected-resource"
@@ -441,6 +475,7 @@ mcp_app = mcp.http_app(path="/mcp", stateless_http=True)
 app = Starlette(
     routes=[
         Route("/health", health, methods=["GET"]),
+        Route("/diagnostics/printify", diagnostics_printify, methods=["GET"]),
         Route("/.well-known/oauth-protected-resource", protected_resource, methods=["GET"]),
         Route("/.well-known/oauth-protected-resource/mcp", protected_resource, methods=["GET"]),
         Route("/mcp/.well-known/oauth-protected-resource", protected_resource, methods=["GET"]),
