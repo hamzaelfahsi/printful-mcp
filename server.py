@@ -35,11 +35,36 @@ async def _request(
     params: dict[str, Any] | None = None,
     json: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # Account-level Printful tokens require X-PF-Store-Id for store-scoped
+    # endpoints. If the caller did not provide one, automatically select the
+    # connected Etsy store (or PRINTFUL_STORE_ID when explicitly configured).
+    selected_store_id = store_id if store_id is not None else os.environ.get("PRINTFUL_STORE_ID")
+    if selected_store_id is None and path != "/stores":
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            stores_response = await client.get(
+                BASE_URL + "/stores",
+                headers=_headers(),
+            )
+        if stores_response.is_error:
+            try:
+                detail = stores_response.json()
+            except ValueError:
+                detail = stores_response.text[:1000]
+            raise RuntimeError(f"Printful API {stores_response.status_code}: {detail}")
+        stores_payload = stores_response.json()
+        stores = stores_payload.get("result", [])
+        etsy_stores = [s for s in stores if str(s.get("type", "")).lower() == "etsy"]
+        if etsy_stores:
+            selected_store_id = etsy_stores[0].get("id")
+        elif stores:
+            selected_store_id = stores[0].get("id")
+        if selected_store_id is None:
+            raise RuntimeError("No Printful store is available. Set PRINTFUL_STORE_ID in Render.")
     async with httpx.AsyncClient(timeout=60.0) as client:
         r = await client.request(
             method,
             BASE_URL + path,
-            headers=_headers(store_id),
+            headers=_headers(selected_store_id),
             params=params,
             json=json,
         )
