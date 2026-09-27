@@ -3,7 +3,7 @@ import base64
 import hashlib
 import secrets
 import json
-from urllib.parse import urlencode
+from urllib.parse import urlencode, parse_qs
 from typing import Any
 
 import httpx
@@ -720,6 +720,201 @@ async def etsy_status(request):
     except RuntimeError as exc:
         return JSONResponse({"ok": False, "authorized": False, "error": str(exc)}, status_code=503)
 
+
+# ---------------------------------------------------------------------------
+# MCP OAuth 2.1 bridge
+# ---------------------------------------------------------------------------
+
+MCP_BASE_URL = "https://printful-mcp-hyfr.onrender.com"
+MCP_ETSY_CALLBACK = f"{MCP_BASE_URL}/etsy/oauth/callback"
+
+async def _mcp_oauth_put(key: str, value: str, ttl: int = 600) -> None:
+    db = await _etsy_token_store()
+    try:
+        await db.setex(key, ttl, value)
+    finally:
+        await db.aclose()
+
+async def _mcp_oauth_get(key: str) -> str | None:
+    db = await _etsy_token_store()
+    try:
+        return await db.get(key)
+    finally:
+        await db.aclose()
+
+async def _mcp_oauth_delete(key: str) -> None:
+    db = await _etsy_token_store()
+    try:
+        await db.delete(key)
+    finally:
+        await db.aclose()
+
+async def _mcp_oauth_json_or_form(request) -> dict[str, Any]:
+    body = await request.body()
+    content_type = request.headers.get("content-type", "").lower()
+    if "application/json" in content_type:
+        try:
+            value = json.loads(body.decode("utf-8") or "{}")
+            return value if isinstance(value, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    parsed = parse_qs(body.decode("utf-8"), keep_blank_values=True)
+    return {key: values[-1] if values else "" for key, values in parsed.items()}
+
+async def mcp_oauth_register(request):
+    payload = await _mcp_oauth_json_or_form(request)
+    redirect_uris = payload.get("redirect_uris", [])
+    if isinstance(redirect_uris, str):
+        redirect_uris = [redirect_uris]
+    if not isinstance(redirect_uris, list) or not redirect_uris:
+        return JSONResponse({"error": "invalid_client_metadata", "error_description": "redirect_uris is required."}, status_code=400)
+    client_id = "mcp_" + secrets.token_urlsafe(24)
+    client_name = payload.get("client_name") or "MCP client"
+    await _mcp_oauth_put(f"mcp:client:{client_id}", json.dumps({"client_name": client_name, "redirect_uris": redirect_uris}), ttl=31536000)
+    return JSONResponse({
+        "client_id": client_id,
+        "client_name": client_name,
+        "redirect_uris": redirect_uris,
+        "token_endpoint_auth_method": "none",
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+    })
+
+async def mcp_oauth_authorize(request):
+    q = request.query_params
+    client_id = q.get("client_id", "")
+    redirect_uri = q.get("redirect_uri", "")
+    response_type = q.get("response_type", "")
+    scope = q.get("scope", os.environ.get("ETSY_SCOPES", "listings_r listings_w shops_r"))
+    state = q.get("state", "")
+    code_challenge = q.get("code_challenge", "")
+    code_challenge_method = q.get("code_challenge_method", "")
+    client_raw = await _mcp_oauth_get(f"mcp:client:{client_id}")
+    if not client_raw:
+        return JSONResponse({"error": "invalid_client"}, status_code=400)
+    client = json.loads(client_raw)
+    if response_type != "code" or redirect_uri not in client.get("redirect_uris", []):
+        return JSONResponse({"error": "invalid_request", "error_description": "Invalid response_type or redirect_uri."}, status_code=400)
+    if not code_challenge or code_challenge_method != "S256":
+        return JSONResponse({"error": "invalid_request", "error_description": "PKCE S256 is required."}, status_code=400)
+    transaction = secrets.token_urlsafe(32)
+    verifier = secrets.token_urlsafe(64)
+    upstream_challenge = _pkce_challenge(verifier)
+    await _mcp_oauth_put(f"mcp:txn:{transaction}", json.dumps({
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": code_challenge_method,
+        "upstream_verifier": verifier,
+    }), ttl=600)
+    query = urlencode({
+        "response_type": "code",
+        "client_id": _etsy_client_id(),
+        "redirect_uri": MCP_ETSY_CALLBACK,
+        "scope": scope,
+        "state": "mcp_" + transaction,
+        "code_challenge": upstream_challenge,
+        "code_challenge_method": "S256",
+    })
+    return RedirectResponse(f"https://www.etsy.com/oauth/connect?{query}", status_code=302)
+
+async def mcp_oauth_token(request):
+    payload = await _mcp_oauth_json_or_form(request)
+    grant_type = payload.get("grant_type", "")
+    if grant_type == "authorization_code":
+        code = payload.get("code", "")
+        verifier = payload.get("code_verifier", "")
+        txn_raw = await _mcp_oauth_get(f"mcp:code:{code}")
+        if not txn_raw or not verifier:
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+        txn = json.loads(txn_raw)
+        if _pkce_challenge(verifier) != txn.get("code_challenge"):
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+        await _mcp_oauth_delete(f"mcp:code:{code}")
+        access_token = secrets.token_urlsafe(48)
+        refresh_token = secrets.token_urlsafe(48)
+        await _mcp_oauth_put(f"mcp:token:{access_token}", json.dumps({"client_id": txn["client_id"]}), ttl=3600)
+        await _mcp_oauth_put(f"mcp:refresh:{refresh_token}", json.dumps({"client_id": txn["client_id"]}), ttl=2592000)
+        return JSONResponse({"access_token": access_token, "token_type": "Bearer", "expires_in": 3600, "refresh_token": refresh_token, "scope": os.environ.get("ETSY_SCOPES", "listings_r listings_w shops_r")})
+    if grant_type == "refresh_token":
+        old_refresh = payload.get("refresh_token", "")
+        raw = await _mcp_oauth_get(f"mcp:refresh:{old_refresh}")
+        if not raw:
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+        access_token = secrets.token_urlsafe(48)
+        await _mcp_oauth_put(f"mcp:token:{access_token}", raw, ttl=3600)
+        return JSONResponse({"access_token": access_token, "token_type": "Bearer", "expires_in": 3600, "scope": os.environ.get("ETSY_SCOPES", "listings_r listings_w shops_r")})
+    return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+
+async def mcp_oauth_etsy_callback(request):
+    params = request.query_params
+    state = params.get("state", "")
+    if not state.startswith("mcp_"):
+        return await etsy_oauth_callback(request)
+    transaction = state[4:]
+    txn_raw = await _mcp_oauth_get(f"mcp:txn:{transaction}")
+    if not txn_raw:
+        return JSONResponse({"error": "invalid_request", "error_description": "OAuth transaction expired."}, status_code=400)
+    txn = json.loads(txn_raw)
+    if params.get("error"):
+        query = urlencode({"error": params.get("error"), "error_description": params.get("error_description", ""), "state": txn.get("state", "")})
+        await _mcp_oauth_delete(f"mcp:txn:{transaction}")
+        return RedirectResponse(f"{txn['redirect_uri']}?{query}", status_code=302)
+    code = params.get("code")
+    if not code:
+        return JSONResponse({"error": "invalid_request", "error_description": "Missing Etsy authorization code."}, status_code=400)
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        token_response = await client.post(
+            "https://api.etsy.com/v3/public/oauth/token",
+            data={"grant_type": "authorization_code", "client_id": _etsy_client_id(), "redirect_uri": MCP_ETSY_CALLBACK, "code": code, "code_verifier": txn["upstream_verifier"]},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+    if token_response.is_error:
+        query = urlencode({"error": "server_error", "error_description": "Etsy token exchange failed.", "state": txn.get("state", "")})
+        return RedirectResponse(f"{txn['redirect_uri']}?{query}", status_code=302)
+    await _etsy_save_tokens(token_response.json())
+    auth_code = secrets.token_urlsafe(48)
+    await _mcp_oauth_put(f"mcp:code:{auth_code}", json.dumps({
+        "client_id": txn["client_id"], "redirect_uri": txn["redirect_uri"], "state": txn.get("state", ""), "code_challenge": txn["code_challenge"]
+    }), ttl=600)
+    await _mcp_oauth_delete(f"mcp:txn:{transaction}")
+    query = urlencode({"code": auth_code, "state": txn.get("state", "")})
+    return RedirectResponse(f"{txn['redirect_uri']}?{query}", status_code=302)
+
+async def mcp_oauth_protected_resource(request):
+    return JSONResponse({
+        "resource": f"{MCP_BASE_URL}/mcp",
+        "authorization_servers": [MCP_BASE_URL],
+        "scopes_supported": os.environ.get("ETSY_SCOPES", "listings_r listings_w shops_r").split(),
+        "bearer_methods_supported": ["header"],
+    })
+
+async def mcp_oauth_authorization_server(request):
+    return JSONResponse({
+        "issuer": MCP_BASE_URL,
+        "authorization_endpoint": f"{MCP_BASE_URL}/oauth/authorize",
+        "token_endpoint": f"{MCP_BASE_URL}/oauth/token",
+        "registration_endpoint": f"{MCP_BASE_URL}/oauth/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+        "scopes_supported": os.environ.get("ETSY_SCOPES", "listings_r listings_w shops_r").split(),
+    })
+
+async def mcp_oauth_guard(request, call_next):
+    if request.url.path != "/mcp":
+        return await call_next(request)
+    authorization = request.headers.get("authorization", "")
+    if not authorization.startswith("Bearer "):
+        return JSONResponse({"error": "unauthorized"}, status_code=401, headers={"WWW-Authenticate": f'Bearer resource_metadata="{MCP_BASE_URL}/.well-known/oauth-protected-resource"'})
+    token = authorization[7:].strip()
+    if not token or not await _mcp_oauth_get(f"mcp:token:{token}"):
+        return JSONResponse({"error": "invalid_token"}, status_code=401, headers={"WWW-Authenticate": f'Bearer resource_metadata="{MCP_BASE_URL}/.well-known/oauth-protected-resource"'})
+    return await call_next(request)
+
+
 async def health(request):
     return JSONResponse({"ok": True, "service": "Printful Manager", "mcp": "/mcp"})
 
@@ -733,14 +928,21 @@ mcp_app = mcp.http_app(path="/mcp", stateless_http=True)
 app = Starlette(
     routes=[
         Route("/health", health, methods=["GET"]),
+        Route("/.well-known/oauth-protected-resource", mcp_oauth_protected_resource, methods=["GET"]),
+        Route("/.well-known/oauth-authorization-server", mcp_oauth_authorization_server, methods=["GET"]),
+        Route("/oauth/register", mcp_oauth_register, methods=["POST"]),
+        Route("/oauth/authorize", mcp_oauth_authorize, methods=["GET"]),
+        Route("/oauth/token", mcp_oauth_token, methods=["POST"]),
         Route("/etsy/oauth/start", etsy_oauth_start, methods=["GET"]),
-        Route("/etsy/oauth/callback", etsy_oauth_callback, methods=["GET"]),
+        Route("/etsy/oauth/callback", mcp_oauth_etsy_callback, methods=["GET"]),
         Route("/etsy/oauth/info", etsy_oauth_info, methods=["GET"]),
         Route("/etsy/status", etsy_status, methods=["GET"]),
         Mount("/", app=mcp_app),
     ],
     lifespan=mcp_app.lifespan,
 )
+
+app.middleware("http")(mcp_oauth_guard)
 
 if __name__ == "__main__":
     import uvicorn
