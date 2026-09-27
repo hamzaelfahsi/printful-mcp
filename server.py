@@ -458,6 +458,109 @@ def _etsy_client_id() -> str:
         raise RuntimeError("ETSY_CLIENT_ID is not configured on the server.")
     return value
 
+def _etsy_api_key() -> str:
+    key = os.environ.get("ETSY_API_KEY", "").strip()
+    if key:
+        return key
+    client_id = os.environ.get("ETSY_CLIENT_ID", "").strip()
+    secret = os.environ.get("ETSY_CLIENT_SECRET", "").strip()
+    if client_id and secret:
+        return f"{client_id}:{secret}"
+    raise RuntimeError("ETSY_API_KEY or ETSY_CLIENT_SECRET is not configured on the server.")
+
+async def _etsy_request(
+    method: str,
+    path: str,
+    *,
+    data: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    access_token = await _etsy_access_token()
+    headers = {
+        "x-api-key": _etsy_api_key(),
+        "Authorization": f"Bearer {access_token}",
+    }
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.request(
+            method,
+            "https://api.etsy.com/v3/application" + path,
+            headers=headers,
+            data=data,
+            params=params,
+        )
+    if response.is_error:
+        try:
+            detail = response.json()
+        except ValueError:
+            detail = response.text[:2000]
+        raise RuntimeError(f"Etsy API {response.status_code}: {detail}")
+    if response.status_code == 204:
+        return {"ok": True}
+    return response.json()
+
+@mcp.tool()
+async def etsy_get_me() -> dict[str, Any]:
+    """Return the authenticated Etsy user."""
+    return await _etsy_request("GET", "/users/me")
+
+@mcp.tool()
+async def etsy_list_my_shops() -> dict[str, Any]:
+    """List the Etsy shops owned by the authenticated user."""
+    me = await _etsy_request("GET", "/users/me")
+    user_id = me.get("user_id")
+    if not user_id:
+        raise RuntimeError("Etsy did not return the authenticated user_id.")
+    return await _etsy_request("GET", f"/users/{user_id}/shops")
+
+@mcp.tool()
+async def etsy_create_draft_listing(
+    title: str,
+    description: str,
+    price: float,
+    quantity: int = 1,
+    taxonomy_id: int = 0,
+    shop_id: int | None = None,
+    who_made: str = "i_did",
+    when_made: str = "made_to_order",
+    tags: list[str] | None = None,
+    materials: list[str] | None = None,
+) -> dict[str, Any]:
+    """Create an Etsy draft listing. It does not publish the listing."""
+    if not title.strip():
+        raise ValueError("title is required.")
+    if price <= 0:
+        raise ValueError("price must be greater than zero.")
+    if quantity < 1:
+        raise ValueError("quantity must be at least 1.")
+    if taxonomy_id < 1:
+        raise ValueError("taxonomy_id must be provided; use etsy_get_seller_taxonomy to find it.")
+    if shop_id is None:
+        shops = await etsy_list_my_shops()
+        shop_id = shops.get("shop_id")
+        if not shop_id:
+            raise RuntimeError("No Etsy shop was found for the authenticated account.")
+    data: dict[str, Any] = {
+        "quantity": str(quantity),
+        "title": title,
+        "description": description,
+        "price": str(price),
+        "who_made": who_made,
+        "when_made": when_made,
+        "taxonomy_id": str(taxonomy_id),
+        "type": "physical",
+    }
+    if tags:
+        data["tags"] = ",".join(tags[:13])
+    if materials:
+        data["materials"] = ",".join(materials)
+    return await _etsy_request("POST", f"/shops/{shop_id}/listings", data=data)
+
+@mcp.tool()
+async def etsy_get_seller_taxonomy() -> dict[str, Any]:
+    """Get Etsy seller taxonomy nodes used to select a valid listing category."""
+    return await _etsy_request("GET", "/seller-taxonomy/nodes")
+
+
 def _etsy_redirect_uri(request) -> str:
     configured = os.environ.get("ETSY_REDIRECT_URI", "").strip()
     if configured:
@@ -511,7 +614,8 @@ async def etsy_oauth_callback(request):
         except ValueError:
             detail = token_response.text[:1000]
         return JSONResponse({"ok": False, "error": "Etsy token exchange failed.", "detail": detail}, status_code=502)
-    response = JSONResponse({"ok": True, "message": "Etsy authorization completed.", "next_step": "Store the refresh token securely in the Printful Manager backend before enabling automatic Etsy listing creation.", "token_received": True})
+    await _etsy_save_tokens(token_response.json())
+    response = JSONResponse({"ok": True, "message": "Etsy authorization completed.", "next_step": "Etsy OAuth is now stored securely. You can use the Etsy listing tools.", "token_received": True})
     response.delete_cookie("etsy_oauth_state", path="/etsy/oauth")
     response.delete_cookie("etsy_oauth_verifier", path="/etsy/oauth")
     return response
