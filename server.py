@@ -1,7 +1,11 @@
 import os
 from typing import Any
+
 import httpx
 from fastmcp import FastMCP
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.routing import Mount, Route
 
 mcp = FastMCP("Printful Manager")
 BASE_URL = "https://api.printful.com"
@@ -344,6 +348,20 @@ async def printful_list_orders(limit: int = 20, offset: int = 0, store_id: int |
 async def printful_get_order(order_id: int | str, store_id: int | str | None = None) -> dict[str, Any]:
     return await _request("GET", f"/orders/{order_id}", store_id=store_id)
 
+async def health(request):
+    return JSONResponse({"ok": True, "service": "Printful Manager", "mcp": "/mcp"})
+
+# Expose a stable ASGI application for Render/uvicorn. Keeping MCP mounted at
+# exactly /mcp makes Streamable HTTP discovery deterministic for ChatGPT.
+app = Starlette(
+    routes=[
+        Route("/health", health, methods=["GET"]),
+        Mount("/mcp", app=mcp.http_app(stateless_http=True)),
+    ]
+)
+
 if __name__ == "__main__":
+    import uvicorn
+
     port = int(os.environ.get("PORT", "10000"))
-    mcp.run(transport="http", host="0.0.0.0", port=port, stateless_http=True)
+    uvicorn.run(app, host="0.0.0.0", port=port)
