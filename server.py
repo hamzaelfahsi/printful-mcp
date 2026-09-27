@@ -783,6 +783,9 @@ async def mcp_oauth_register(request):
 
 async def mcp_oauth_authorize(request):
     q = request.query_params
+    resource = q.get("resource", "")
+    if resource and resource != MCP_BASE_URL:
+        return JSONResponse({"error": "invalid_target", "error_description": "Invalid resource."}, status_code=400)
     client_id = q.get("client_id", "")
     redirect_uri = q.get("redirect_uri", "")
     response_type = q.get("response_type", "")
@@ -805,6 +808,7 @@ async def mcp_oauth_authorize(request):
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "state": state,
+        "resource": resource or MCP_BASE_URL,
         "code_challenge": code_challenge,
         "code_challenge_method": code_challenge_method,
         "upstream_verifier": verifier,
@@ -822,6 +826,9 @@ async def mcp_oauth_authorize(request):
 
 async def mcp_oauth_token(request):
     payload = await _mcp_oauth_json_or_form(request)
+    resource = payload.get("resource", "")
+    if resource and resource != MCP_BASE_URL:
+        return JSONResponse({"error": "invalid_target", "error_description": "Invalid resource."}, status_code=400)
     grant_type = payload.get("grant_type", "")
     if grant_type == "authorization_code":
         code = payload.get("code", "")
@@ -835,8 +842,8 @@ async def mcp_oauth_token(request):
         await _mcp_oauth_delete(f"mcp:code:{code}")
         access_token = secrets.token_urlsafe(48)
         refresh_token = secrets.token_urlsafe(48)
-        await _mcp_oauth_put(f"mcp:token:{access_token}", json.dumps({"client_id": txn["client_id"]}), ttl=3600)
-        await _mcp_oauth_put(f"mcp:refresh:{refresh_token}", json.dumps({"client_id": txn["client_id"]}), ttl=2592000)
+        await _mcp_oauth_put(f"mcp:token:{access_token}", json.dumps({"client_id": txn["client_id"], "resource": txn.get("resource", MCP_BASE_URL)}), ttl=3600)
+        await _mcp_oauth_put(f"mcp:refresh:{refresh_token}", json.dumps({"client_id": txn["client_id"], "resource": txn.get("resource", MCP_BASE_URL)}), ttl=2592000)
         return JSONResponse({"access_token": access_token, "token_type": "Bearer", "expires_in": 3600, "refresh_token": refresh_token, "scope": os.environ.get("ETSY_SCOPES", "listings_r listings_w shops_r")})
     if grant_type == "refresh_token":
         old_refresh = payload.get("refresh_token", "")
@@ -885,7 +892,7 @@ async def mcp_oauth_etsy_callback(request):
 
 async def mcp_oauth_protected_resource(request):
     return JSONResponse({
-        "resource": f"{MCP_BASE_URL}/mcp",
+        "resource": MCP_BASE_URL,
         "authorization_servers": [MCP_BASE_URL],
         "scopes_supported": os.environ.get("ETSY_SCOPES", "listings_r listings_w shops_r").split(),
         "bearer_methods_supported": ["header"],
@@ -908,11 +915,31 @@ async def mcp_oauth_guard(request, call_next):
     if request.url.path != "/mcp":
         return await call_next(request)
     authorization = request.headers.get("authorization", "")
+    metadata_url = f"{MCP_BASE_URL}/.well-known/oauth-protected-resource"
     if not authorization.startswith("Bearer "):
-        return JSONResponse({"error": "unauthorized"}, status_code=401, headers={"WWW-Authenticate": f'Bearer resource_metadata="{MCP_BASE_URL}/.well-known/oauth-protected-resource"'})
+        return JSONResponse(
+            {"error": "unauthorized"},
+            status_code=401,
+            headers={"WWW-Authenticate": f'Bearer resource_metadata="{metadata_url}", error="invalid_token", error_description="Authentication required."'},
+        )
     token = authorization[7:].strip()
-    if not token or not await _mcp_oauth_get(f"mcp:token:{token}"):
-        return JSONResponse({"error": "invalid_token"}, status_code=401, headers={"WWW-Authenticate": f'Bearer resource_metadata="{MCP_BASE_URL}/.well-known/oauth-protected-resource"'})
+    raw = await _mcp_oauth_get(f"mcp:token:{token}") if token else None
+    if not raw:
+        return JSONResponse(
+            {"error": "invalid_token"},
+            status_code=401,
+            headers={"WWW-Authenticate": f'Bearer resource_metadata="{metadata_url}", error="invalid_token", error_description="Access token is invalid or expired."'},
+        )
+    try:
+        token_data = json.loads(raw)
+    except Exception:
+        token_data = {}
+    if token_data.get("resource", MCP_BASE_URL) != MCP_BASE_URL:
+        return JSONResponse(
+            {"error": "invalid_token"},
+            status_code=401,
+            headers={"WWW-Authenticate": f'Bearer resource_metadata="{metadata_url}", error="invalid_token", error_description="Token audience is invalid."'},
+        )
     return await call_next(request)
 
 
