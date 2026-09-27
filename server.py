@@ -2,6 +2,7 @@ import os
 import base64
 import hashlib
 import secrets
+import json
 from urllib.parse import urlencode
 from typing import Any
 
@@ -10,6 +11,8 @@ from fastmcp import FastMCP
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse, RedirectResponse
 from starlette.routing import Mount, Route
+from cryptography.fernet import Fernet
+from redis.asyncio import Redis
 
 mcp = FastMCP("Printful Manager")
 BASE_URL = "https://api.printful.com"
@@ -370,6 +373,85 @@ async def printful_get_order(order_id: int | str, store_id: int | str | None = N
     return await _request("GET", f"/orders/{order_id}", store_id=store_id)
 
 
+
+async def _etsy_token_store() -> Redis:
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url:
+        raise RuntimeError("REDIS_URL is not configured on the server.")
+    return Redis.from_url(url, decode_responses=True)
+
+
+def _etsy_fernet() -> Fernet:
+    key = os.environ.get("ETSY_TOKEN_ENCRYPTION_KEY", "").strip()
+    if not key:
+        raise RuntimeError("ETSY_TOKEN_ENCRYPTION_KEY is not configured on the server.")
+    return Fernet(key.encode("ascii"))
+
+
+async def _etsy_save_tokens(token_data: dict[str, Any]) -> None:
+    refresh_token = token_data.get("refresh_token")
+    if not refresh_token:
+        raise RuntimeError("Etsy did not return a refresh token.")
+    payload = {
+        "refresh_token": refresh_token,
+        "scope": token_data.get("scope", ""),
+    }
+    db = await _etsy_token_store()
+    try:
+        await db.set("etsy:oauth", _etsy_fernet().encrypt(json.dumps(payload).encode()).decode())
+    finally:
+        await db.aclose()
+
+
+async def _etsy_load_tokens() -> dict[str, Any] | None:
+    db = await _etsy_token_store()
+    try:
+        raw = await db.get("etsy:oauth")
+    finally:
+        await db.aclose()
+    if not raw:
+        return None
+    try:
+        return json.loads(_etsy_fernet().decrypt(raw.encode()).decode())
+    except Exception as exc:
+        raise RuntimeError("Stored Etsy credentials could not be decrypted.") from exc
+
+
+async def _etsy_access_token() -> str:
+    stored = await _etsy_load_tokens()
+    if not stored or not stored.get("refresh_token"):
+        raise RuntimeError("Etsy is not authorized yet. Open /etsy/oauth/start first.")
+    client_id = _etsy_client_id()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            "https://api.etsy.com/v3/public/oauth/token",
+            data={
+                "grant_type": "refresh_token",
+                "client_id": client_id,
+                "refresh_token": stored["refresh_token"],
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+    if response.is_error:
+        try:
+            detail = response.json()
+        except ValueError:
+            detail = response.text[:1000]
+        raise RuntimeError(f"Etsy refresh failed: {detail}")
+    token_data = response.json()
+    await _etsy_save_tokens(token_data)
+    return token_data["access_token"]
+
+
+@mcp.tool()
+async def etsy_test_connection() -> dict[str, Any]:
+    try:
+        access_token = await _etsy_access_token()
+        return {"ok": True, "authorized": True, "token_refreshed": bool(access_token)}
+    except RuntimeError as exc:
+        return {"ok": False, "authorized": False, "error": str(exc)}
+
+
 def _etsy_client_id() -> str:
     value = os.environ.get("ETSY_CLIENT_ID", "").strip()
     if not value:
@@ -437,6 +519,14 @@ async def etsy_oauth_callback(request):
 async def etsy_oauth_info(request):
     return JSONResponse({"ok": True, "authorization_start": str(request.base_url).rstrip("/") + "/etsy/oauth/start", "redirect_uri": _etsy_redirect_uri(request), "scopes": os.environ.get("ETSY_SCOPES", "listings_r listings_w shops_r"), "client_id_configured": bool(os.environ.get("ETSY_CLIENT_ID", "").strip())})
 
+
+async def etsy_status(request):
+    try:
+        stored = await _etsy_load_tokens()
+        return JSONResponse({"ok": True, "authorized": bool(stored), "scope": stored.get("scope", "") if stored else None})
+    except RuntimeError as exc:
+        return JSONResponse({"ok": False, "authorized": False, "error": str(exc)}, status_code=503)
+
 async def health(request):
     return JSONResponse({"ok": True, "service": "Printful Manager", "mcp": "/mcp"})
 
@@ -453,6 +543,7 @@ app = Starlette(
         Route("/etsy/oauth/start", etsy_oauth_start, methods=["GET"]),
         Route("/etsy/oauth/callback", etsy_oauth_callback, methods=["GET"]),
         Route("/etsy/oauth/info", etsy_oauth_info, methods=["GET"]),
+        Route("/etsy/status", etsy_status, methods=["GET"]),
         Mount("/", app=mcp_app),
     ],
     lifespan=mcp_app.lifespan,
