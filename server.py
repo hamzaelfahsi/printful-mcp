@@ -1,10 +1,14 @@
 import os
+import base64
+import hashlib
+import secrets
+from urllib.parse import urlencode
 from typing import Any
 
 import httpx
 from fastmcp import FastMCP
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, RedirectResponse
 from starlette.routing import Mount, Route
 
 mcp = FastMCP("Printful Manager")
@@ -365,6 +369,74 @@ async def printful_list_orders(limit: int = 20, offset: int = 0, store_id: int |
 async def printful_get_order(order_id: int | str, store_id: int | str | None = None) -> dict[str, Any]:
     return await _request("GET", f"/orders/{order_id}", store_id=store_id)
 
+
+def _etsy_client_id() -> str:
+    value = os.environ.get("ETSY_CLIENT_ID", "").strip()
+    if not value:
+        raise RuntimeError("ETSY_CLIENT_ID is not configured on the server.")
+    return value
+
+def _etsy_redirect_uri(request) -> str:
+    configured = os.environ.get("ETSY_REDIRECT_URI", "").strip()
+    if configured:
+        return configured
+    return str(request.base_url).rstrip("/") + "/etsy/oauth/callback"
+
+def _pkce_challenge(verifier: str) -> str:
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+async def etsy_oauth_start(request):
+    try:
+        client_id = _etsy_client_id()
+    except RuntimeError as exc:
+        return JSONResponse({"ok": False, "error": str(exc), "setup": "Set ETSY_CLIENT_ID in Render, then redeploy.", "redirect_uri": _etsy_redirect_uri(request)}, status_code=503)
+    state = secrets.token_urlsafe(32)
+    verifier = secrets.token_urlsafe(64)
+    challenge = _pkce_challenge(verifier)
+    redirect_uri = _etsy_redirect_uri(request)
+    scopes = os.environ.get("ETSY_SCOPES", "listings_r listings_w shops_r").strip()
+    query = urlencode({"response_type": "code", "client_id": client_id, "redirect_uri": redirect_uri, "scope": scopes, "state": state, "code_challenge": challenge, "code_challenge_method": "S256"})
+    response = RedirectResponse(url=f"https://www.etsy.com/oauth/connect?{query}", status_code=302)
+    response.set_cookie("etsy_oauth_state", state, max_age=600, httponly=True, secure=True, samesite="lax", path="/etsy/oauth")
+    response.set_cookie("etsy_oauth_verifier", verifier, max_age=600, httponly=True, secure=True, samesite="lax", path="/etsy/oauth")
+    return response
+
+async def etsy_oauth_callback(request):
+    params = request.query_params
+    if params.get("error"):
+        return JSONResponse({"ok": False, "error": params.get("error"), "error_description": params.get("error_description")}, status_code=400)
+    code = params.get("code")
+    state = params.get("state")
+    saved_state = request.cookies.get("etsy_oauth_state")
+    verifier = request.cookies.get("etsy_oauth_verifier")
+    if not code or not state:
+        return JSONResponse({"ok": False, "error": "Missing Etsy authorization code or state."}, status_code=400)
+    if not saved_state or not secrets.compare_digest(state, saved_state):
+        return JSONResponse({"ok": False, "error": "Invalid OAuth state. Restart authorization from the start URL."}, status_code=400)
+    if not verifier:
+        return JSONResponse({"ok": False, "error": "Missing PKCE verifier cookie. Restart authorization from the start URL."}, status_code=400)
+    try:
+        client_id = _etsy_client_id()
+    except RuntimeError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
+    redirect_uri = _etsy_redirect_uri(request)
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        token_response = await client.post("https://api.etsy.com/v3/public/oauth/token", data={"grant_type": "authorization_code", "client_id": client_id, "redirect_uri": redirect_uri, "code": code, "code_verifier": verifier}, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    if token_response.is_error:
+        try:
+            detail = token_response.json()
+        except ValueError:
+            detail = token_response.text[:1000]
+        return JSONResponse({"ok": False, "error": "Etsy token exchange failed.", "detail": detail}, status_code=502)
+    response = JSONResponse({"ok": True, "message": "Etsy authorization completed.", "next_step": "Store the refresh token securely in the Printful Manager backend before enabling automatic Etsy listing creation.", "token_received": True})
+    response.delete_cookie("etsy_oauth_state", path="/etsy/oauth")
+    response.delete_cookie("etsy_oauth_verifier", path="/etsy/oauth")
+    return response
+
+async def etsy_oauth_info(request):
+    return JSONResponse({"ok": True, "authorization_start": str(request.base_url).rstrip("/") + "/etsy/oauth/start", "redirect_uri": _etsy_redirect_uri(request), "scopes": os.environ.get("ETSY_SCOPES", "listings_r listings_w shops_r"), "client_id_configured": bool(os.environ.get("ETSY_CLIENT_ID", "").strip())})
+
 async def health(request):
     return JSONResponse({"ok": True, "service": "Printful Manager", "mcp": "/mcp"})
 
@@ -378,6 +450,9 @@ mcp_app = mcp.http_app(path="/mcp", stateless_http=True)
 app = Starlette(
     routes=[
         Route("/health", health, methods=["GET"]),
+        Route("/etsy/oauth/start", etsy_oauth_start, methods=["GET"]),
+        Route("/etsy/oauth/callback", etsy_oauth_callback, methods=["GET"]),
+        Route("/etsy/oauth/info", etsy_oauth_info, methods=["GET"]),
         Mount("/", app=mcp_app),
     ],
     lifespan=mcp_app.lifespan,
