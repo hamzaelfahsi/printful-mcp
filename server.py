@@ -351,13 +351,19 @@ async def printful_get_order(order_id: int | str, store_id: int | str | None = N
 async def health(request):
     return JSONResponse({"ok": True, "service": "Printful Manager", "mcp": "/mcp"})
 
-# Expose a stable ASGI application for Render/uvicorn. Keeping MCP mounted at
-# exactly /mcp makes Streamable HTTP discovery deterministic for ChatGPT.
+# Expose the FastMCP ASGI app directly at /mcp.
+# FastMCP owns the MCP route itself; mounting an app that already contains
+# /mcp under /mcp would incorrectly produce /mcp/mcp.
+# Keep the FastMCP lifespan on the parent Starlette app so its session manager
+# is initialized correctly.
+mcp_app = mcp.http_app(path="/mcp", stateless_http=True)
+
 app = Starlette(
     routes=[
         Route("/health", health, methods=["GET"]),
-        Mount("/mcp", app=mcp.http_app(stateless_http=True)),
-    ]
+        Mount("/", app=mcp_app),
+    ],
+    lifespan=mcp_app.lifespan,
 )
 
 if __name__ == "__main__":
