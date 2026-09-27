@@ -62,28 +62,35 @@ async def printful_get_store(store_id: int | str) -> dict[str, Any]:
     return await _request("GET", f"/stores/{store_id}")
 
 @mcp.tool()
+async def printful_list_categories() -> dict[str, Any]:
+    """List Printful catalog categories."""
+    return await _request("GET", "/categories")
+
+async def _list_catalog_products(
+    limit: int = 100,
+    offset: int = 0,
+    category_id: str | None = None,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {"limit": limit, "offset": offset}
+    if category_id:
+        params["category_id"] = category_id
+    return await _request("GET", "/products", params=params)
+
+
+@mcp.tool()
 async def printful_list_catalog_products(
     limit: int = 100,
     offset: int = 0,
     category_id: str | None = None,
 ) -> dict[str, Any]:
     """List Printful catalog products, optionally filtered by category IDs."""
-    params: dict[str, Any] = {"limit": limit, "offset": offset}
-    if category_id:
-        params["category_id"] = category_id
-    return await _request("GET", "/products", params=params)
+    return await _list_catalog_products(limit=limit, offset=offset, category_id=category_id)
 
-@mcp.tool()
-async def printful_list_categories() -> dict[str, Any]:
-    """List Printful catalog categories."""
-    return await _request("GET", "/categories")
 
 @mcp.tool()
 async def printful_list_phone_cases(limit: int = 100, offset: int = 0) -> dict[str, Any]:
     """List iPhone and Samsung case catalog products."""
-    return await printful_list_catalog_products(
-        limit=limit, offset=offset, category_id="50,62"
-    )
+    return await _list_catalog_products(limit=limit, offset=offset, category_id="50,62")
 
 @mcp.tool()
 async def printful_get_catalog_product(product_id: int) -> dict[str, Any]:
@@ -234,10 +241,20 @@ async def printful_publish_store_product(
     store_id: int | str | None = None,
 ) -> dict[str, Any]:
     """Explicit publication call; Printful publication uses POST /store/products."""
-    return await printful_create_store_product(
-        sync_product=sync_product,
-        sync_variants=sync_variants,
+    if not sync_product.get("name"):
+        raise ValueError("sync_product.name is required.")
+    if not sync_variants:
+        raise ValueError("sync_variants must contain at least one variant.")
+    for index, variant in enumerate(sync_variants):
+        if "variant_id" not in variant:
+            raise ValueError(f"sync_variants[{index}].variant_id is required.")
+        if not variant.get("files"):
+            raise ValueError(f"sync_variants[{index}].files is required.")
+    return await _request(
+        "POST",
+        "/store/products",
         store_id=store_id,
+        json={"sync_product": sync_product, "sync_variants": sync_variants},
     )
 
 
