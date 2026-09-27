@@ -649,16 +649,9 @@ async def mcp_oauth_guard(request,call_next):
     return await call_next(request)
 
 async def health(request):
-    return JSONResponse({"ok":True,"service":"Printify Manager","mcp":"/mcp","printify_api_configured":bool(os.environ.get("PRINTIFY_API_TOKEN","").strip())})
+    return JSONResponse({"ok": True, "service": "Printify Manager", "mcp": "/mcp", "printify_api_configured": bool(os.environ.get("PRINTIFY_API_TOKEN","").strip())})
 
-async def health(request):
-    return JSONResponse({"ok": True, "service": "Printful Manager", "mcp": "/mcp"})
-
-# Expose the FastMCP ASGI app directly at /mcp.
-# FastMCP owns the MCP route itself; mounting an app that already contains
-# /mcp under /mcp would incorrectly produce /mcp/mcp.
-# Keep the FastMCP lifespan on the parent Starlette app so its session manager
-# is initialized correctly.
+# FastMCP owns the /mcp route.
 mcp_app = mcp.http_app(path="/mcp", stateless_http=True)
 
 app = Starlette(
@@ -676,10 +669,6 @@ app = Starlette(
         Route("/oauth/register", mcp_oauth_register, methods=["POST"]),
         Route("/oauth/authorize", mcp_oauth_authorize, methods=["GET"]),
         Route("/oauth/token", mcp_oauth_token, methods=["POST"]),
-        Route("/etsy/oauth/start", etsy_oauth_start, methods=["GET"]),
-        Route("/etsy/oauth/callback", mcp_oauth_etsy_callback, methods=["GET"]),
-        Route("/etsy/oauth/info", etsy_oauth_info, methods=["GET"]),
-        Route("/etsy/status", etsy_status, methods=["GET"]),
         Mount("/", app=mcp_app),
     ],
     lifespan=mcp_app.lifespan,
@@ -693,6 +682,4 @@ app.add_middleware(MCPOAuthMiddleware)
 
 if __name__ == "__main__":
     import uvicorn
-
-    port = int(os.environ.get("PORT", "10000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
