@@ -240,8 +240,17 @@ async def printful_delete_store_product(product_id: int | str, store_id: int | s
     return await _request("DELETE", f"/store/products/{product_id}", store_id=store_id)
 
 @mcp.tool()
-async def printful_list_files(limit: int = 100, offset: int = 0) -> dict[str, Any]:
-    return await _request("GET", "/files", {"limit": limit, "offset": offset})
+async def printful_list_files(
+    limit: int = 100,
+    offset: int = 0,
+    store_id: int | str | None = None,
+) -> dict[str, Any]:
+    return await _request(
+        "GET",
+        "/files",
+        store_id=store_id,
+        params={"limit": limit, "offset": offset},
+    )
 
 @mcp.tool()
 async def printful_get_store_variant(variant_id: int | str, store_id: int | str | None = None) -> dict[str, Any]:
