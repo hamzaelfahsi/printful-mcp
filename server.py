@@ -58,8 +58,28 @@ async def printful_get_store(store_id: int | str) -> dict[str, Any]:
     return await _request("GET", f"/stores/{store_id}")
 
 @mcp.tool()
-async def printful_list_catalog_products(limit: int = 100, offset: int = 0) -> dict[str, Any]:
-    return await _request("GET", "/products", params={"limit": limit, "offset": offset})
+async def printful_list_catalog_products(
+    limit: int = 100,
+    offset: int = 0,
+    category_id: str | None = None,
+) -> dict[str, Any]:
+    """List Printful catalog products, optionally filtered by category IDs."""
+    params: dict[str, Any] = {"limit": limit, "offset": offset}
+    if category_id:
+        params["category_id"] = category_id
+    return await _request("GET", "/products", params=params)
+
+@mcp.tool()
+async def printful_list_categories() -> dict[str, Any]:
+    """List Printful catalog categories."""
+    return await _request("GET", "/categories")
+
+@mcp.tool()
+async def printful_list_phone_cases(limit: int = 100, offset: int = 0) -> dict[str, Any]:
+    """List iPhone and Samsung case catalog products."""
+    return await printful_list_catalog_products(
+        limit=limit, offset=offset, category_id="50,62"
+    )
 
 @mcp.tool()
 async def printful_get_catalog_product(product_id: int) -> dict[str, Any]:
