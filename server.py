@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 from fastmcp import FastMCP
 from starlette.applications import Starlette
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, RedirectResponse
 from starlette.routing import Mount, Route
 from cryptography.fernet import Fernet
@@ -929,7 +930,14 @@ app = Starlette(
     routes=[
         Route("/health", health, methods=["GET"]),
         Route("/.well-known/oauth-protected-resource", mcp_oauth_protected_resource, methods=["GET"]),
+        Route("/.well-known/oauth-protected-resource/mcp", mcp_oauth_protected_resource, methods=["GET"]),
+        Route("/mcp/.well-known/oauth-protected-resource", mcp_oauth_protected_resource, methods=["GET"]),
         Route("/.well-known/oauth-authorization-server", mcp_oauth_authorization_server, methods=["GET"]),
+        Route("/.well-known/oauth-authorization-server/mcp", mcp_oauth_authorization_server, methods=["GET"]),
+        Route("/mcp/.well-known/oauth-authorization-server", mcp_oauth_authorization_server, methods=["GET"]),
+        Route("/.well-known/openid-configuration", mcp_oauth_authorization_server, methods=["GET"]),
+        Route("/.well-known/openid-configuration/mcp", mcp_oauth_authorization_server, methods=["GET"]),
+        Route("/mcp/.well-known/openid-configuration", mcp_oauth_authorization_server, methods=["GET"]),
         Route("/oauth/register", mcp_oauth_register, methods=["POST"]),
         Route("/oauth/authorize", mcp_oauth_authorize, methods=["GET"]),
         Route("/oauth/token", mcp_oauth_token, methods=["POST"]),
@@ -942,7 +950,11 @@ app = Starlette(
     lifespan=mcp_app.lifespan,
 )
 
-app.middleware("http")(mcp_oauth_guard)
+class MCPOAuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        return await mcp_oauth_guard(request, call_next)
+
+app.add_middleware(MCPOAuthMiddleware)
 
 if __name__ == "__main__":
     import uvicorn
