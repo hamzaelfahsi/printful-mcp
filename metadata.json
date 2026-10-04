@@ -1,0 +1,8 @@
+{
+  "name": "EtsyPilot AI",
+  "description": "Plateforme centralisée de gestion, automatisation Pinterest, SEO IA, tracking et analytics pour boutique Etsy",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

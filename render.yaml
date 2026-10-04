@@ -1,5 +1,6 @@
 services:
   - type: web
+<<<<<<< HEAD
     name: printful-mcp
     runtime: python
     buildCommand: pip install -r requirements.txt
@@ -10,3 +11,52 @@ services:
         sync: false
       - key: PRINTFUL_STORE_ID
         sync: false
+=======
+    name: etsypilot-ai
+    env: node
+    plan: standard
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: DATABASE_URL
+        fromDatabase:
+          name: etsypilot-db
+          property: connectionString
+      - key: GEMINI_MODEL
+        value: models/gemini-2.5-flash
+      - key: AI_ANALYSIS_DAILY_LIMIT
+        value: 50
+      - key: CONTROLLED_PUBLICATION_TEST
+        value: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: TOKEN_ENCRYPTION_KEY
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: ETSY_CLIENT_ID
+        sync: false
+      - key: ETSY_CLIENT_SECRET
+        sync: false
+      - key: ETSY_REDIRECT_URI
+        sync: false
+      - key: PINTEREST_APP_ID
+        sync: false
+      - key: PINTEREST_APP_SECRET
+        sync: false
+      - key: PINTEREST_REDIRECT_URI
+        sync: false
+
+databases:
+  - name: etsypilot-db
+    plan: standard
+    databaseName: etsypilot_db
+    user: etsypilot_user
+    ipAllowList: []
+>>>>>>> e2a4753 (feat: initial EtsyPilot AI application)

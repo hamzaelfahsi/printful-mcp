@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Printify Manager MCP
 
 Secure Streamable HTTP MCP bridge for the official Printify REST API.
@@ -44,3 +45,25 @@ https://printful-mcp-hyfr.onrender.com/mcp
 8. Publish only when explicitly requested.
 
 The API follows Printify's documented shop, catalog, upload, product and publish endpoints.
+=======
+<div align="center">
+<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
+</div>
+
+# Run and deploy your AI Studio app
+
+This contains everything you need to run your app locally.
+
+View your app in AI Studio: https://ai.studio/apps/6a65fc36-9447-47d5-a049-33e5b0a01c32
+
+## Run Locally
+
+**Prerequisites:**  Node.js
+
+
+1. Install dependencies:
+   `npm install`
+2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
+3. Run the app:
+   `npm run dev`
+>>>>>>> e2a4753 (feat: initial EtsyPilot AI application)
